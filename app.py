@@ -2,10 +2,11 @@ import streamlit as st
 import pandas as pd
 import requests
 import re
+from urllib.parse import urlparse
 from thefuzz import fuzz, process
 
 # ==========================================
-# 1. SÉCURITÉ ET ACCÈS
+# 1. CONFIGURATION ET SÉCURITÉ
 # ==========================================
 st.set_page_config(page_title="CSSF Hunter - Global Scan", layout="wide", page_icon="🕵️‍♂️")
 
@@ -26,7 +27,7 @@ def check_password():
 
 if check_password():
     # ==========================================
-    # 2. CHARGEMENT DES CSV ET PRÉPARATION
+    # 2. CHARGEMENT DES REGISTRES (CSV)
     # ==========================================
     @st.cache_data
     def load_db():
@@ -34,12 +35,10 @@ if check_password():
         dfs = []
         for f in files:
             try:
-                df = pd.read_csv(f)
-                dfs.append(df)
+                dfs.append(pd.read_csv(f))
             except: pass
         if not dfs: return pd.DataFrame(columns=['Name'])
         full_df = pd.concat(dfs, ignore_index=True)
-        # On nettoie les noms pour le matching
         full_df['Name'] = full_df['Name'].astype(str)
         return full_df
 
@@ -47,75 +46,76 @@ if check_password():
     official_names = db['Name'].tolist()
 
     # ==========================================
-    # 3. DÉFINITION DES CHUNKS (GROUPES DE RECHERCHE)
+    # 3. CHUNKS DE CHASSE (AVEC NOUVEAUX MOTS-CLÉS)
     # ==========================================
-    # On divise par langue pour éviter des requêtes trop lourdes
+    # Ajout de AIFM, GFIA, RAIF, SCSP, SCS
+    extra_kws = "AIFM OR GFIA OR RAIF OR SCSP OR SCS"
+    
     SEARCH_CHUNKS = {
-        "Français": "Luxembourg CSSF (supervisé OR autorisé OR enregistré OR régulé OR agréé)",
-        "English": "Luxembourg CSSF (supervised OR authorized OR registered OR regulated OR licensed)",
-        "Español": "Luxembourg CSSF (supervisado OR autorizado OR registrado OR regulado OR supervisión)",
-        "Italiano": "Luxembourg CSSF (supervisionato OR autorizzato OR registrato OR regolato OR vigilanza)"
+        "Français": f"Luxembourg CSSF (supervisé OR autorisé OR enregistré OR régulé OR agréé) ({extra_kws})",
+        "English": f"Luxembourg CSSF (supervised OR authorized OR registered OR regulated OR licensed) ({extra_kws})",
+        "Español": f"Luxembourg CSSF (supervisado OR autorizado OR registrado OR regulado) ({extra_kws})",
+        "Italiano": f"Luxembourg CSSF (supervisionato OR autorizzato OR registrato OR regolato) ({extra_kws})"
     }
 
     # ==========================================
-    # 4. MOTEUR DE CHASSE (CHUNKED SEARCH)
+    # 4. FONCTIONS DE CHASSE
     # ==========================================
     def run_chunked_hunt():
         api_key = st.secrets.get("SERPER_API_KEY")
         if not api_key:
-            st.error("API Key manquante dans les secrets.")
+            st.error("API Key manquante.")
             return []
             
         url = "https://google.serper.dev/search"
         headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
-        all_results = {} # Utilisation d'un dict pour dédoublonner par URL
+        all_results = {}
 
         progress_bar = st.progress(0)
         status_text = st.empty()
 
         for i, (lang, query) in enumerate(SEARCH_CHUNKS.items()):
-            status_text.text(f"Scan en cours : {lang}...")
-            # On demande 20 résultats par langue (donc 80 au total)
-            payload = {"q": f"{query} -site:cssf.lu", "num": 20}
+            status_text.text(f"Scan en cours ({lang})...")
+            # Requête excluant le site officiel
+            payload = {"q": f"{query} -site:cssf.lu", "num": 25}
             try:
                 r = requests.post(url, headers=headers, json=payload)
                 organic = r.json().get('organic', [])
                 for res in organic:
-                    all_results[res['link']] = res # Dédoublonnage automatique par lien
+                    all_results[res['link']] = res
             except Exception as e:
-                st.error(f"Erreur sur le chunk {lang}: {e}")
-            
+                st.error(f"Erreur {lang}: {e}")
             progress_bar.progress((i + 1) / len(SEARCH_CHUNKS))
         
-        status_text.text("Scan terminé. Analyse des correspondances...")
+        status_text.text("Scan Web terminé. Analyse des domaines...")
         return list(all_results.values())
 
     # ==========================================
-    # 5. INTERFACE
+    # 5. INTERFACE ET RÉSULTATS
     # ==========================================
-    st.title("🕵️‍♂️ CSSF Hunter : Scan Global Internet")
-    st.markdown("""
-    Cette version divise la recherche en 4 requêtes (FR, EN, ES, IT) pour contourner les limites de Google.
-    Les noms détectés sont ensuite comparés à vos fichiers CSV via **Fuzzy Matching**.
-    """)
+    st.title("🕵️‍♂️ CSSF Hunter : Full Internet Scan")
+    st.markdown("Recherche de successions de mots-clés : `AIFM, GFIA, RAIF, SCSP, SCS` combinés aux termes de supervision.")
 
-    if st.button("🚀 Lancer la Chasse (Multi-Chunk Scan)"):
+    if st.button("🚀 Lancer la Chasse (Global Search)"):
         raw_hits = run_chunked_hunt()
         
         if not raw_hits:
-            st.warning("Aucun résultat suspect n'est ressorti des 4 scans.")
+            st.warning("Aucun résultat suspect.")
         else:
             alerts = []
 
             for res in raw_hits:
-                # Nettoyage du titre pour isoler le nom
+                # Extraction du nom de domaine
+                domain = urlparse(res['link']).netloc
+                
+                # Extraction du nom potentiel depuis le titre
                 potential_name = res['title'].split('|')[0].split('-')[0].split(':')[0].strip()
                 
-                # Fuzzy Match contre la DB (80% est un bon seuil pour le clonage)
+                # Fuzzy Matching
                 best_match, score = process.extractOne(potential_name, official_names, scorer=fuzz.token_set_ratio)
                 
-                # Calcul Risque
-                if score < 55:
+                # Détermination du Risque
+                if score < 50:
                     risk, color, priority = "CRITIQUE (Inconnu)", "red", 1
                 elif score < 90:
                     risk, color, priority = "SUSPECT (Clonage ?)", "orange", 2
@@ -123,6 +123,7 @@ if check_password():
                     risk, color, priority = "LÉGITIME (Vérifié)", "green", 3
 
                 alerts.append({
+                    "domain": domain,
                     "title": res['title'],
                     "link": res['link'],
                     "snippet": res.get('snippet', ''),
@@ -134,26 +135,30 @@ if check_password():
                     "priority": priority
                 })
 
-            # Tri : Critiques et Suspects en haut
+            # Tri par priorité (Critiques en premier)
             alerts = sorted(alerts, key=lambda x: x['priority'])
 
-            st.write(f"### 🛡️ Résultats de l'analyse ({len(alerts)} sites détectés)")
+            st.write(f"### 🛡️ Résultats de l'analyse")
             
             for a in alerts:
-                # On n'affiche que les suspects et critiques pour plus de clarté
-                if a['priority'] < 3:
+                if a['priority'] < 3: # On met en avant les suspects et critiques
                     with st.container():
                         st.markdown(f"""
-                        <div style="border-left: 8px solid {a['color']}; padding: 15px; margin: 10px 0; background-color: #f8f9fa; border-radius: 5px; box-shadow: 2px 2px 5px rgba(0,0,0,0.05);">
-                            <strong style="color: {a['color']};">{a['risk']}</strong> | Score Match : {a['score']}%<br>
-                            <h4 style="margin: 5px 0;"><a href="{a['link']}" target="_blank">{a['found_name']}</a></h4>
-                            <p style="color: #666; font-size: 0.9em; margin-bottom: 5px;"><i>"{a['snippet']}"</i></p>
-                            <small>Nom officiel le plus proche : <b>{a['best_match']}</b></small>
+                        <div style="border-left: 10px solid {a['color']}; padding: 15px; margin: 10px 0; background-color: #f1f3f6; border-radius: 8px;">
+                            <div style="display: flex; justify-content: space-between;">
+                                <strong style="color: {a['color']};">{a['risk']}</strong>
+                                <code style="background: #e1e4e8; padding: 2px 5px;">Site : {a['domain']}</code>
+                            </div>
+                            <h3 style="margin: 10px 0;"><a href="{a['link']}" target="_blank" style="text-decoration:none; color:#1f77b4;">{a['found_name']}</a></h3>
+                            <p style="color: #444; font-size: 0.95em;"><i>"{a['snippet']}"</i></p>
+                            <div style="margin-top: 10px; font-size: 0.85em; border-top: 1px solid #ccc; padding-top: 5px;">
+                                <b>Analyse Registry :</b> {a['score']}% de ressemblance avec <code>{a['best_match']}</code>
+                            </div>
                         </div>
                         """, unsafe_allow_html=True)
                 else:
-                    with st.expander(f"✅ {a['found_name']} (Vérifié - {a['score']}%)"):
+                    with st.expander(f"✅ {a['domain']} - {a['found_name']} (Match: {a['score']}%)"):
                         st.write(f"Lien : {a['link']}")
                         st.write(f"Snippet : {a['snippet']}")
 
-    st.sidebar.write(f"📊 Registres : {len(official_names)} entités.")
+    st.sidebar.info(f"Base chargée : {len(official_names)} entités AIFM.")
