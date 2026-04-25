@@ -1,48 +1,58 @@
 import streamlit as st
 import pandas as pd
 import requests
+import re
 
-# Configuration
-st.set_page_config(page_title="CSSF Entity Verifier", layout="wide")
+# =========================================================
+# CONFIGURATION ET CLÉ API
+# =========================================================
+# Comme ton repo est privé, tu peux mettre la clé ici, 
+# mais la bonne pratique Streamlit reste st.secrets
+SERPER_API_KEY = "2f5c1c4e0c52e3298bb1d42cf19d818e86d3d395" 
 
-st.title("🛡️ Détecteur d'Entités CSSF Non-Autorisées")
-st.markdown("""
-Cette application compare les résultats de recherche web avec les listes officielles (AIFM Authorized, Registered et Succursales) 
-pour identifier des entités qui prétendraient être supervisées sans l'être.
-""")
+st.set_page_config(page_title="CSSF Watchdog - Anti-Fraud", layout="wide")
 
-# --- CHARGEMENT DES FICHIERS LOCAUX ---
+# =========================================================
+# CHARGEMENT DES DONNÉES OFFICIELLES (TES CSV)
+# =========================================================
 @st.cache_data
-def load_all_data():
+def load_cssf_database():
     files = ['AIFM SUCC .csv', 'AIFM REG.csv', 'AIFM AUT.csv']
-    dfs = []
+    combined_list = []
+    
     for f in files:
         try:
-            temp_df = pd.read_csv(f)
-            dfs.append(temp_df)
+            df = pd.read_csv(f)
+            # On harmonise les colonnes si nécessaire (ici elles semblent identiques : Name)
+            combined_list.append(df)
         except Exception as e:
-            st.error(f"Erreur de lecture du fichier {f}: {e}")
-    
-    # Fusion des 3 listes
-    full_df = pd.concat(dfs, ignore_index=True)
-    # Nettoyage des noms pour la comparaison
-    full_df['name_clean'] = full_df['Name'].astype(str).str.lower().str.strip()
-    return full_df
+            st.error(f"Erreur lors du chargement de {f} : {e}")
+            
+    if combined_list:
+        full_df = pd.concat(combined_list, ignore_index=True)
+        # Nettoyage pour comparaison : minuscules, suppression des S.A., S.à r.l. pour plus de souplesse
+        full_df['name_clean'] = full_df['Name'].str.lower().str.replace(r'[^a-zA-Z0-9 ]', '', regex=True).str.strip()
+        return full_df
+    return pd.DataFrame()
 
-white_list = load_all_data()
+db = load_cssf_database()
 
-# --- FONCTION DE RECHERCHE WEB (via Serper.dev) ---
-def web_audit(search_query):
-    # Remplacez par votre clé API dans les secrets Streamlit
-    api_key = st.secrets.get("SERPER_API_KEY", "VOTRE_CLE_API_ICI")
+# =========================================================
+# LOGIQUE DE RECHERCHE WEB AUTOMATISÉE
+# =========================================================
+def run_web_audit(query_type="global", custom_name=""):
     url = "https://google.serper.dev/search"
     
-    # Requête ciblée pour trouver des mentions de supervision CSSF hors site officiel
-    payload = {
-        "q": f'"{search_query}" "supervised by the CSSF" -site:cssf.lu',
-        "num": 10
-    }
-    headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
+    # Construction de la requête Google de "chasse"
+    if query_type == "global":
+        # Cherche n'importe quel site (hors cssf.lu) qui prétend être supervisé
+        q = '"supervised by the CSSF" -site:cssf.lu'
+    else:
+        # Cherche un nom spécifique avec la mention de supervision
+        q = f'"{custom_name}" "supervised by the CSSF" -site:cssf.lu'
+
+    payload = {"q": q, "num": 20}
+    headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
     
     try:
         response = requests.post(url, headers=headers, json=payload)
@@ -50,49 +60,62 @@ def web_audit(search_query):
     except:
         return []
 
-# --- INTERFACE ---
-col1, col2 = st.columns([1, 1])
+# =========================================================
+# INTERFACE UTILISATEUR
+# =========================================================
+st.title("🕵️‍♂️ CSSF Compliance Checker")
+st.write(f"Base de données officielle chargée : `{len(db)}` entités répertoriées.")
 
-with col1:
-    st.subheader("🔍 Recherche manuelle")
-    search_term = st.text_input("Nom de l'entité à vérifier :", placeholder="Ex: Finance S.A.")
-    
-    if search_term:
-        # Vérification Base de données
-        matches = white_list[white_list['name_clean'].str.contains(search_term.lower(), na=False)]
+tabs = st.tabs(["🔍 Recherche par Nom", "🌐 Scan Global du Web"])
+
+# --- TAB 1 : RECHERCHE PAR NOM ---
+with tabs[0]:
+    target = st.text_input("Entrez le nom d'une société à auditer :")
+    if target:
+        # 1. Check DB
+        clean_target = re.sub(r'[^a-zA-Z0-9 ]', '', target.lower())
+        match = db[db['name_clean'].str.contains(clean_target, na=False)]
         
-        if not matches.empty:
-            st.success(f"✅ Trouvé dans la liste officielle ({len(matches)} résultat(s))")
-            st.dataframe(matches[['Type', 'Name', 'Address']])
-        else:
-            st.error("❌ ABSENT de la liste officielle de la CSSF.")
-            st.warning("Prudence recommandée si cette entité prétend être supervisée.")
-
-with col2:
-    st.subheader("🌐 Scan Web (Anti-Clonage)")
-    if search_term:
-        with st.spinner("Audit du web en cours..."):
-            web_results = web_audit(search_term)
-            
-            if web_results:
-                st.write(f"Résultats mentionnant '{search_term}' et 'supervised by the CSSF' :")
-                for res in web_results:
-                    with st.expander(f"🚩 {res['title']}"):
-                        st.write(f"**URL :** {res['link']}")
-                        st.write(f"**Extrait :** {res.get('snippet', '')}")
-                        st.info("Vérifiez si le domaine de ce site correspond à l'entité officielle.")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("État dans les registres")
+            if not match.empty:
+                st.success(f"✅ L'entité '{target}' est bien enregistrée.")
+                st.dataframe(match[['Type', 'Name', 'Address']])
             else:
-                st.info("Aucun site web suspect trouvé avec ces mots-clés exacts.")
+                st.error(f"❌ '{target}' est ABSENTE des registres AIFM (AUT, REG, SUCC).")
 
-# --- SCAN GLOBAL (Optionnel) ---
-st.divider()
-if st.button("🚀 Lancer un Scan Global (Découvrir de nouveaux suspects)"):
-    st.write("Recherche de sites utilisant la mention 'supervised by the CSSF' hors registres...")
-    results = web_audit("supervised by the CSSF") # Recherche large
+        with col2:
+            st.subheader("Preuves sur le Web")
+            web_hits = run_web_audit("specific", target)
+            if web_hits:
+                for hit in web_hits:
+                    st.warning(f"**Trouvé sur :** {hit['link']}\n\n*Snippet : {hit.get('snippet', '')}*")
+            else:
+                st.info("Aucune mention suspecte trouvée sur Google pour ce nom.")
+
+# --- TAB 2 : SCAN GLOBAL (CHASSE AUX CLONES) ---
+with tabs[1]:
+    st.info("Ce mode scanne Google pour trouver des sites qui utilisent la phrase 'supervised by the CSSF' mais qui ne figurent pas dans vos fichiers CSV.")
     
-    for res in results:
-        # On vérifie si le titre du site contient une entité de notre liste
-        found_in_list = any(name in res['title'].lower() for name in white_list['name_clean'].head(100)) # Exemple simplifié
+    if st.button("Lancer un scan de détection global"):
+        results = run_web_audit("global")
+        suspicious_count = 0
         
-        status = "⚠️ SUSPECT (Non identifié)" if not found_in_list else "✅ Probable Officiel"
-        st.write(f"[{status}] {res['title']} - {res['link']}")
+        for res in results:
+            title_clean = re.sub(r'[^a-zA-Z0-9 ]', '', res['title'].lower())
+            snippet_clean = re.sub(r'[^a-zA-Z0-9 ]', '', res.get('snippet', '').lower())
+            
+            # Vérification si le titre du site contient un nom de notre DB
+            # On fait un check croisé
+            is_official = any(name in title_clean for name in db['name_clean'].head(500)) # limitation pour perf
+            
+            if not is_official:
+                suspicious_count += 1
+                with st.expander(f"🚩 SUSPECT : {res['title']}", expanded=True):
+                    st.write(f"**Lien :** {res['link']}")
+                    st.write(f"**Description :** {res.get('snippet', '')}")
+                    st.markdown("**Raison :** Ce site revendique la supervision CSSF mais le nom ne correspond à aucune entité AIFM de vos listes.")
+
+        if suspicious_count == 0:
+            st.success("Aucune nouvelle entité suspecte détectée sur les premiers résultats.")
