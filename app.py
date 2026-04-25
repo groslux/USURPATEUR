@@ -46,25 +46,26 @@ if check_password():
     official_names = db['Name'].tolist()
 
     # ==========================================
-    # 3. CHUNKS DE CHASSE (AVEC NOUVEAUX MOTS-CLÉS)
+    # 3. STRATÉGIE DE CHASSE (MULTI-REQUÊTES)
     # ==========================================
-    # Ajout de AIFM, GFIA, RAIF, SCSP, SCS
-    extra_kws = "AIFM OR GFIA OR RAIF OR SCSP OR SCS"
-    
-    SEARCH_CHUNKS = {
-        "Français": f"Luxembourg CSSF (supervisé OR autorisé OR enregistré OR régulé OR agréé) ({extra_kws})",
-        "English": f"Luxembourg CSSF (supervised OR authorized OR registered OR regulated OR licensed) ({extra_kws})",
-        "Español": f"Luxembourg CSSF (supervisado OR autorizado OR registrado OR regulado) ({extra_kws})",
-        "Italiano": f"Luxembourg CSSF (supervisionato OR autorizzato OR registrato OR regolato) ({extra_kws})"
-    }
+    # On définit des thèmes de recherche simples pour ne pas perdre Google
+    SEARCH_THEMES = [
+        "CSSF Luxembourg supervised",
+        "CSSF Luxembourg authorized",
+        "CSSF Luxembourg registered",
+        "CSSF Luxembourg regulated",
+        "CSSF Luxembourg AIFM",
+        "CSSF Luxembourg RAIF",
+        "CSSF Luxembourg GFIA",
+        "CSSF Luxembourg SCSP",
+        "CSSF Luxembourg SCS",
+        "CSSF Luxembourg authorized manager"
+    ]
 
-    # ==========================================
-    # 4. FONCTIONS DE CHASSE
-    # ==========================================
-    def run_chunked_hunt():
+    def run_multi_theme_hunt():
         api_key = st.secrets.get("SERPER_API_KEY")
         if not api_key:
-            st.error("API Key manquante.")
+            st.error("API Key manquante dans les Secrets Streamlit.")
             return []
             
         url = "https://google.serper.dev/search"
@@ -74,53 +75,55 @@ if check_password():
         progress_bar = st.progress(0)
         status_text = st.empty()
 
-        for i, (lang, query) in enumerate(SEARCH_CHUNKS.items()):
-            status_text.text(f"Scan en cours ({lang})...")
-            # Requête excluant le site officiel
-            payload = {"q": f"{query} -site:cssf.lu", "num": 25}
+        for i, theme in enumerate(SEARCH_THEMES):
+            status_text.text(f"Recherche en cours : {theme}...")
+            # On exclut le site officiel pour trouver les autres
+            payload = {"q": f"{theme} -site:cssf.lu", "num": 20}
             try:
                 r = requests.post(url, headers=headers, json=payload)
                 organic = r.json().get('organic', [])
                 for res in organic:
-                    all_results[res['link']] = res
+                    all_results[res['link']] = res # Dédoublonnage par lien
             except Exception as e:
-                st.error(f"Erreur {lang}: {e}")
-            progress_bar.progress((i + 1) / len(SEARCH_CHUNKS))
+                st.error(f"Erreur sur le thème {theme}: {e}")
+            
+            progress_bar.progress((i + 1) / len(SEARCH_THEMES))
         
-        status_text.text("Scan Web terminé. Analyse des domaines...")
+        status_text.text("Analyse des résultats terminée.")
         return list(all_results.values())
 
     # ==========================================
-    # 5. INTERFACE ET RÉSULTATS
+    # 4. INTERFACE ET ANALYSE
     # ==========================================
-    st.title("🕵️‍♂️ CSSF Hunter : Full Internet Scan")
-    st.markdown("Recherche de successions de mots-clés : `AIFM, GFIA, RAIF, SCSP, SCS` combinés aux termes de supervision.")
+    st.title("🕵️‍♂️ CSSF Hunter : Full Internet Active Scan")
+    st.markdown("Recherche globale par thèmes : `AIFM, GFIA, RAIF, SCSP, SCS` + Supervision.")
 
-    if st.button("🚀 Lancer la Chasse (Global Search)"):
-        raw_hits = run_chunked_hunt()
+    if st.button("🚀 Lancer le Scan Global (Active Hunting)"):
+        raw_hits = run_multi_theme_hunt()
         
         if not raw_hits:
-            st.warning("Aucun résultat suspect.")
+            st.warning("Aucun résultat trouvé. Vérifiez votre clé API Serper.")
         else:
             alerts = []
 
             for res in raw_hits:
-                # Extraction du nom de domaine
+                # 1. Extraction du domaine
                 domain = urlparse(res['link']).netloc
                 
-                # Extraction du nom potentiel depuis le titre
+                # 2. Extraction du nom probable (nettoyage titre)
                 potential_name = res['title'].split('|')[0].split('-')[0].split(':')[0].strip()
                 
-                # Fuzzy Matching
+                # 3. Fuzzy Matching (Comparaison avec les 3 CSV)
+                # On utilise token_set_ratio car les noms de fonds sont souvent longs
                 best_match, score = process.extractOne(potential_name, official_names, scorer=fuzz.token_set_ratio)
                 
-                # Détermination du Risque
+                # 4. Détermination du Risque
                 if score < 50:
-                    risk, color, priority = "CRITIQUE (Inconnu)", "red", 1
-                elif score < 90:
-                    risk, color, priority = "SUSPECT (Clonage ?)", "orange", 2
+                    risk, color, priority = "🚨 CRITIQUE (Inconnu)", "#d32f2f", 1
+                elif score < 85:
+                    risk, color, priority = "⚠️ SUSPECT (Clonage ?)", "#f57c00", 2
                 else:
-                    risk, color, priority = "LÉGITIME (Vérifié)", "green", 3
+                    risk, color, priority = "✅ LÉGITIME (Match)", "#388e3c", 3
 
                 alerts.append({
                     "domain": domain,
@@ -135,30 +138,33 @@ if check_password():
                     "priority": priority
                 })
 
-            # Tri par priorité (Critiques en premier)
+            # Tri : Critiques et Suspects en haut
             alerts = sorted(alerts, key=lambda x: x['priority'])
 
-            st.write(f"### 🛡️ Résultats de l'analyse")
+            st.write(f"### 🛡️ Résultats du scan ({len(alerts)} sites analysés)")
             
             for a in alerts:
-                if a['priority'] < 3: # On met en avant les suspects et critiques
+                # On affiche les suspects et critiques de manière détaillée
+                if a['priority'] < 3:
                     with st.container():
                         st.markdown(f"""
-                        <div style="border-left: 10px solid {a['color']}; padding: 15px; margin: 10px 0; background-color: #f1f3f6; border-radius: 8px;">
+                        <div style="border-left: 10px solid {a['color']}; padding: 15px; margin: 10px 0; background-color: #f9f9f9; border-radius: 8px; box-shadow: 1px 1px 3px rgba(0,0,0,0.1);">
                             <div style="display: flex; justify-content: space-between;">
-                                <strong style="color: {a['color']};">{a['risk']}</strong>
-                                <code style="background: #e1e4e8; padding: 2px 5px;">Site : {a['domain']}</code>
+                                <strong style="color: {a['color']}; font-size: 1.1em;">{a['risk']}</strong>
+                                <span style="background: #eee; padding: 2px 8px; border-radius: 4px; font-family: monospace;">{a['domain']}</span>
                             </div>
-                            <h3 style="margin: 10px 0;"><a href="{a['link']}" target="_blank" style="text-decoration:none; color:#1f77b4;">{a['found_name']}</a></h3>
-                            <p style="color: #444; font-size: 0.95em;"><i>"{a['snippet']}"</i></p>
-                            <div style="margin-top: 10px; font-size: 0.85em; border-top: 1px solid #ccc; padding-top: 5px;">
-                                <b>Analyse Registry :</b> {a['score']}% de ressemblance avec <code>{a['best_match']}</code>
+                            <h3 style="margin: 10px 0;"><a href="{a['link']}" target="_blank" style="text-decoration:none; color:#0066cc;">{a['found_name']}</a></h3>
+                            <p style="color: #444; font-size: 0.9em; line-height: 1.4;">{a['snippet']}</p>
+                            <div style="margin-top: 10px; font-size: 0.85em; color: #666; border-top: 1px solid #ddd; padding-top: 5px;">
+                                <b>Analyse des registres :</b> {a['score']}% de correspondance avec l'entité officielle : <code>{a['best_match']}</code>
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
                 else:
-                    with st.expander(f"✅ {a['domain']} - {a['found_name']} (Match: {a['score']}%)"):
-                        st.write(f"Lien : {a['link']}")
-                        st.write(f"Snippet : {a['snippet']}")
+                    # Les légitimes sont rangés dans des menus déroulants pour ne pas polluer
+                    with st.expander(f"✅ {a['domain']} ({a['found_name']}) - Match {a['score']}%"):
+                        st.write(f"**Titre complet :** {a['title']}")
+                        st.write(f"**Lien :** {a['link']}")
+                        st.write(f"**Snippet :** {a['snippet']}")
 
-    st.sidebar.info(f"Base chargée : {len(official_names)} entités AIFM.")
+    st.sidebar.info(f"Base de données : {len(official_names)} entités AIFM chargées.")
